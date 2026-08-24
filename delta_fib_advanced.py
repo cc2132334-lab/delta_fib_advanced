@@ -1,6 +1,5 @@
 import time
-from datetime import datetime
-import pytz
+from datetime import datetime, timezone
 import requests
 
 # --- TELEGRAM CONFIG ---
@@ -21,7 +20,7 @@ def send_telegram(msg):
     except Exception as e:
         print(f"Connection Error: {e}")
 
-def get_delta_candles(symbol, resolution="5m", count=288):
+def get_delta_candles(symbol, resolution="5m", count=300):
     end_time = int(time.time())
     start_time = end_time - (count * 5 * 60)
         
@@ -67,41 +66,39 @@ def get_delta_candles(symbol, resolution="5m", count=288):
         return []
 
 def run_fibonacci_scanner():
-    ist = pytz.timezone('Asia/Kolkata')
-    today_str = datetime.now(ist).strftime("%Y-%m-%d")
-    print(f"[{datetime.now(ist).strftime('%H:%M:%S')}] Scanning Intraday Fibonacci Setups...")
+    now_utc = datetime.now(timezone.utc)
+    # 00:00:00 UTC Start Time
+    start_of_day_utc = datetime(now_utc.year, now_utc.month, now_utc.day, tzinfo=timezone.utc)
+    start_of_day_ts = int(start_of_day_utc.timestamp())
+
+    print(f"[{now_utc.strftime('%H:%M:%S')} UTC] Scanning Intraday Setups (UTC Session)...")
 
     for sym in DELTA_SYMBOLS:
         try:
-            candles = get_delta_candles(sym, resolution="5m", count=288)
+            candles = get_delta_candles(sym, resolution="5m", count=300)
             if len(candles) < 20:
                 continue
 
-            # આજના દિવસની કેન્ડલ્સ (00:00 IST પછી)
-            today_candles = []
-            for c in candles:
-                c_date = datetime.fromtimestamp(c["time"], ist).strftime("%Y-%m-%d")
-                if c_date == today_str:
-                    today_candles.append(c)
+            # 00:00 UTC પછીની આજના દિવસની કેન્ડલ્સ
+            today_candles = [c for c in candles if c["time"] >= start_of_day_ts]
+            eval_candles = today_candles if len(today_candles) >= 12 else candles[-60:]
 
-            eval_candles = today_candles if len(today_candles) >= 15 else candles[-60:]
-
-            # લેટેસ્ટ ક્લોઝ થયેલી કન્ફર્મેશન કેન્ડલ (-2) અને અગાઉની (-3)
+            # લેટેસ્ટ પૂર્ણ થયેલી કન્ફર્મેશન કેન્ડલ (-2) અને તે અગાઉની (-3)
             latest = eval_candles[-2]
             prev = eval_candles[-3]
 
-            c_time = datetime.fromtimestamp(latest["time"], ist).strftime("%H:%M")
+            c_time = datetime.fromtimestamp(latest["time"], timezone.utc).strftime("%H:%M")
             c_open = latest["open"]
             c_high = latest["high"]
             c_low = latest["low"]
             c_close = latest["close"]
 
             search_window = eval_candles[:-2]
-            if len(search_window) < 10:
+            if len(search_window) < 6:
                 continue
 
             # ==========================================
-            # 🟢 BUY SETUP (Day Low ➔ Swing High ➔ Pullback)
+            # 🟢 BUY SETUP LOGIC (Day Low ➔ Swing High)
             # ==========================================
             all_lows = [x["low"] for x in search_window]
             day_low = min(all_lows)
@@ -115,26 +112,41 @@ def run_fibonacci_scanner():
                 swing_high_idx = day_low_idx + swing_high_rel_idx
 
                 if swing_high_idx > day_low_idx:
-                    time_day_low = datetime.fromtimestamp(search_window[day_low_idx]["time"], ist).strftime("%H:%M")
-                    time_swing_high = datetime.fromtimestamp(search_window[swing_high_idx]["time"], ist).strftime("%H:%M")
+                    time_day_low = datetime.fromtimestamp(search_window[day_low_idx]["time"], timezone.utc).strftime("%H:%M")
+                    time_swing_high = datetime.fromtimestamp(search_window[swing_high_idx]["time"], timezone.utc).strftime("%H:%M")
 
                     swing_range = swing_high - day_low
                     if swing_range > 0:
                         fib_50 = swing_high - (0.50 * swing_range)
                         fib_618 = swing_high - (0.618 * swing_range)
 
-                        touched_zone = (prev["low"] <= fib_50) or (c_low <= fib_50)
-                        held_above_618 = (c_close >= fib_618 * 0.998)
-                        is_green = (c_close > c_open)
+                        # શરત ૧: અગાઉની કેન્ડલ ઉપરથી આવીને 0.50 - 0.618 ઝોનની અંદર ક્લોઝ આપે
+                        prev_closed_inside = (prev["close"] <= fib_50 and prev["close"] >= fib_618)
 
-                        if touched_zone and held_above_618 and is_green:
-                            # Entry: Confirmation કેન્ડલના High પરથી
+                        # શરત ૨: જો કેન્ડલ 0.618 ની નીચે ક્લોઝ થઈ જાય તો SETUP INVALID ALERT
+                        if prev_closed_inside and c_close < (fib_618 * 0.999):
+                            alert_invalid_buy = (
+                                f"⚠️ *FIBONACCI BUY SETUP INVALIDATED*\n"
+                                f"💎 *Pair:* `{sym}` (5-Min)\n"
+                                f"❌ *Reason:* Candle closed below 0.618 level\n"
+                                f"━━━━━━━━━━━━━━━━━━━━\n"
+                                f"📉 *Day Low:* `${day_low:,.2f}` _({time_day_low} UTC)_\n"
+                                f"📈 *Swing High:* `${swing_high:,.2f}` _({time_swing_high} UTC)_\n"
+                                f"🟠 *Fib 61.8%:* `${fib_618:,.2f}`\n"
+                                f"💥 *Candle Close:* `${c_close:,.2f}`\n"
+                                f"⏱ *Invalid Time:* `{c_time} UTC`"
+                            )
+                            send_telegram(alert_invalid_buy)
+                            continue
+
+                        # શરત ૩: કન્ફર્મેશન કેન્ડલ ઝોનની ઉપર (0.50 ઉપર) ક્લોઝ આપે
+                        if prev_closed_inside and c_close >= fib_50 and c_close > c_open:
                             entry_price = c_high
 
-                            # SL Logic
-                            if c_low < fib_618:
-                                stop_loss = c_low
-                                sl_type = f"Candle Low (${stop_loss:,.2f})"
+                            # SL Logic: જો નીચે સ્પાઇક ગઈ હોય તો Candle Low, નહિતર 0.618 લેવલ
+                            if min(prev["low"], c_low) < fib_618:
+                                stop_loss = min(prev["low"], c_low)
+                                sl_type = f"Spike Low (${stop_loss:,.2f})"
                             else:
                                 stop_loss = fib_618
                                 sl_type = f"Fib 0.618 Level (${stop_loss:,.2f})"
@@ -150,10 +162,10 @@ def run_fibonacci_scanner():
                                 alert_buy = (
                                     f"🎯 *FIBONACCI 0.5-0.618 BUY SIGNAL*\n"
                                     f"💎 *Pair:* `{sym}` (5-Min)\n"
-                                    f"🟢 *Signal:* *STRONG BUY (Pullback Setup)*\n"
+                                    f"🟢 *Signal:* *STRONG BUY (Confirmed Entry)*\n"
                                     f"━━━━━━━━━━━━━━━━━━━━\n"
-                                    f"📉 *Day Low:* `${day_low:,.2f}` _({time_day_low} IST)_\n"
-                                    f"📈 *Swing High:* `${swing_high:,.2f}` _({time_swing_high} IST)_\n"
+                                    f"📉 *Day Low:* `${day_low:,.2f}` _({time_day_low} UTC)_\n"
+                                    f"📈 *Swing High:* `${swing_high:,.2f}` _({time_swing_high} UTC)_\n"
                                     f"🟡 *Fib 50.0%:* `${fib_50:,.2f}`\n"
                                     f"🟠 *Fib 61.8%:* `${fib_618:,.2f}`\n"
                                     f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -168,13 +180,13 @@ def run_fibonacci_scanner():
                                     f"  • *1:4 Target:* `${t4:,.2f}`\n"
                                     f"  • *1:5 Target:* `${t5:,.2f}`\n"
                                     f"━━━━━━━━━━━━━━━━━━━━\n"
-                                    f"⏱ *Trigger Candle:* `{c_time} IST`"
+                                    f"⏱ *Entry Candle Time:* `{c_time} UTC`"
                                 )
                                 send_telegram(alert_buy)
                                 continue
 
             # ==========================================
-            # 🔴 SELL SETUP (Day High ➔ Swing Low ➔ Pullback)
+            # 🔴 SELL SETUP LOGIC (Day High ➔ Swing Low)
             # ==========================================
             all_highs = [x["high"] for x in search_window]
             day_high = max(all_highs)
@@ -188,28 +200,43 @@ def run_fibonacci_scanner():
                 swing_low_idx = day_high_idx + swing_low_rel_idx
 
                 if swing_low_idx > day_high_idx:
-                    time_day_high = datetime.fromtimestamp(search_window[day_high_idx]["time"], ist).strftime("%H:%M")
-                    time_swing_low = datetime.fromtimestamp(search_window[swing_low_idx]["time"], ist).strftime("%H:%M")
+                    time_day_high = datetime.fromtimestamp(search_window[day_high_idx]["time"], timezone.utc).strftime("%H:%M")
+                    time_swing_low = datetime.fromtimestamp(search_window[swing_low_idx]["time"], timezone.utc).strftime("%H:%M")
 
                     swing_range = day_high - swing_low
                     if swing_range > 0:
-                        fib_50 = swing_low + (0.50 * swing_range)
-                        fib_618 = swing_low + (0.618 * swing_range)
+                        fib_50_sell = swing_low + (0.50 * swing_range)
+                        fib_618_sell = swing_low + (0.618 * swing_range)
 
-                        touched_zone = (prev["high"] >= fib_50) or (c_high >= fib_50)
-                        held_below_618 = (c_close <= fib_618 * 1.002)
-                        is_red = (c_close < c_open)
+                        # શરત ૧: અગાઉની કેન્ડલ નીચેથી આવીને 0.50 - 0.618 ઝોનની અંદર ક્લોઝ આપે
+                        prev_closed_inside_sell = (prev["close"] >= fib_50_sell and prev["close"] <= fib_618_sell)
 
-                        if touched_zone and held_below_618 and is_red:
-                            # Entry: Confirmation કેન્ડલના Low પરથી
+                        # શરત ૨: જો કેન્ડલ 0.618 ની ઉપર ક્લોઝ થઈ જાય તો SETUP INVALID ALERT
+                        if prev_closed_inside_sell and c_close > (fib_618_sell * 1.001):
+                            alert_invalid_sell = (
+                                f"⚠️ *FIBONACCI SELL SETUP INVALIDATED*\n"
+                                f"💎 *Pair:* `{sym}` (5-Min)\n"
+                                f"❌ *Reason:* Candle closed above 0.618 level\n"
+                                f"━━━━━━━━━━━━━━━━━━━━\n"
+                                f"📈 *Day High:* `${day_high:,.2f}` _({time_day_high} UTC)_\n"
+                                f"📉 *Swing Low:* `${swing_low:,.2f}` _({time_swing_low} UTC)_\n"
+                                f"🟠 *Fib 61.8%:* `${fib_618_sell:,.2f}`\n"
+                                f"💥 *Candle Close:* `${c_close:,.2f}`\n"
+                                f"⏱ *Invalid Time:* `{c_time} UTC`"
+                            )
+                            send_telegram(alert_invalid_sell)
+                            continue
+
+                        # શરત ૩: કન્ફર્મેશન કેન્ડલ ઝોનની નીચે (0.50 નીચે) ક્લોઝ આપે
+                        if prev_closed_inside_sell and c_close <= fib_50_sell and c_close < c_open:
                             entry_price = c_low
 
-                            # SL Logic
-                            if c_high > fib_618:
-                                stop_loss = c_high
-                                sl_type = f"Candle High (${stop_loss:,.2f})"
+                            # SL Logic: જો ઉપર સ્પાઇક ગઈ હોય તો Candle High, નહિતર 0.618 લેવલ
+                            if max(prev["high"], c_high) > fib_618_sell:
+                                stop_loss = max(prev["high"], c_high)
+                                sl_type = f"Spike High (${stop_loss:,.2f})"
                             else:
-                                stop_loss = fib_618
+                                stop_loss = fib_618_sell
                                 sl_type = f"Fib 0.618 Level (${stop_loss:,.2f})"
 
                             risk = stop_loss - entry_price
@@ -223,12 +250,12 @@ def run_fibonacci_scanner():
                                 alert_sell = (
                                     f"🎯 *FIBONACCI 0.5-0.618 SELL SIGNAL*\n"
                                     f"💎 *Pair:* `{sym}` (5-Min)\n"
-                                    f"🔴 *Signal:* *STRONG SELL (Pullback Setup)*\n"
+                                    f"🔴 *Signal:* *STRONG SELL (Confirmed Entry)*\n"
                                     f"━━━━━━━━━━━━━━━━━━━━\n"
-                                    f"📈 *Day High:* `${day_high:,.2f}` _({time_day_high} IST)_\n"
-                                    f"📉 *Swing Low:* `${swing_low:,.2f}` _({time_swing_low} IST)_\n"
-                                    f"🟠 *Fib 61.8%:* `${fib_618:,.2f}`\n"
-                                    f"🟡 *Fib 50.0%:* `${fib_50:,.2f}`\n"
+                                    f"📈 *Day High:* `${day_high:,.2f}` _({time_day_high} UTC)_\n"
+                                    f"📉 *Swing Low:* `${swing_low:,.2f}` _({time_swing_low} UTC)_\n"
+                                    f"🟠 *Fib 61.8%:* `${fib_618_sell:,.2f}`\n"
+                                    f"🟡 *Fib 50.0%:* `${fib_50_sell:,.2f}`\n"
                                     f"━━━━━━━━━━━━━━━━━━━━\n"
                                     f"🔻 *Entry (Candle Low):* `${entry_price:,.2f}`\n"
                                     f"🛑 *Stop Loss:* `${stop_loss:,.2f}` _({sl_type})_\n"
@@ -241,7 +268,7 @@ def run_fibonacci_scanner():
                                     f"  • *1:4 Target:* `${t4:,.2f}`\n"
                                     f"  • *1:5 Target:* `${t5:,.2f}`\n"
                                     f"━━━━━━━━━━━━━━━━━━━━\n"
-                                    f"⏱ *Trigger Candle:* `{c_time} IST`"
+                                    f"⏱ *Entry Candle Time:* `{c_time} UTC`"
                                 )
                                 send_telegram(alert_sell)
                                 continue
