@@ -1,0 +1,26 @@
+name: Delta Fibonacci 5M Hunter (24x7)
+
+on:
+  schedule:
+    # Runs every 5 minutes automatically 24/7
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  run-fib-scanner:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: pip install requests pytz
+
+      - name: Execute Scanner
+        run: python delta_fib_advanced.py
+
